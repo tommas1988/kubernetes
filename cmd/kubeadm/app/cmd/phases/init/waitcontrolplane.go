@@ -19,6 +19,7 @@ package phases
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"text/template"
 	"time"
 
@@ -31,6 +32,12 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	dryrunutil "k8s.io/kubernetes/cmd/kubeadm/app/util/dryrun"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
+	"k8s.io/kubernetes/pkg/probe"
+	httpprobe "k8s.io/kubernetes/pkg/probe/http"
 )
 
 var (
@@ -95,7 +102,18 @@ func runWaitControlPlanePhase(c workflow.RunData) error {
 
 	fmt.Printf("[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory %q. This can take up to %v\n", data.ManifestDir(), timeout)
 
-	if err := waiter.WaitForKubeletAndFunc(waiter.WaitForAPI); err != nil {
+	prober := getControlPlaneComponentStartupProber(data.Cfg())
+	if err := waiter.WaitForKubeletAndFunc(func() error {
+		start := time.Now()
+		return wait.PollImmediate(10*time.Second, timeout, func() (bool, error) {
+			if started := prober.isStartup(); !started {
+				return false, nil
+			} else {
+				fmt.Printf("[wait-control-plane] All control plane components are startup after %f seconds\n", time.Since(start).Seconds())
+				return true, nil
+			}
+		})
+	}); err != nil {
 		context := struct {
 			Error  string
 			Socket string
@@ -118,4 +136,66 @@ func newControlPlaneWaiter(dryRun bool, timeout time.Duration, client clientset.
 	}
 
 	return apiclient.NewKubeWaiter(client, timeout, out), nil
+}
+
+type startupResult bool
+
+type startupProber []func(ch chan<- startupResult)
+
+// getControlPlaneComponentStartupProber get all control plane component startup probes
+func getControlPlaneComponentStartupProber(cfg *kubeadm.InitConfiguration) startupProber {
+	specs := controlplane.GetStaticPodSpecs(&cfg.ClusterConfiguration, &cfg.LocalAPIEndpoint, nil)
+	prober := startupProber{}
+	for name, podSpec := range specs {
+		for _, container := range podSpec.Spec.Containers {
+			p := container.StartupProbe
+			// Currently control plane component only use http probe
+			if p.HTTPGet != nil {
+				req, err := httpprobe.NewRequestForHTTPGetAction(p.HTTPGet, &container, "", "kubeadm")
+				if err != nil {
+					klog.V(2).ErrorS(err, "[wait-control-plane] Failed to create control plane component startup probe request", "component", name)
+					continue
+				}
+
+				timeout := time.Duration(p.TimeoutSeconds) * time.Second
+				f := func(req *http.Request, component string) func(chan<- startupResult) {
+					return func(ch chan<- startupResult) {
+						prober := httpprobe.New(false)
+						result, msg, err := prober.Probe(req, timeout)
+						if result != probe.Success {
+							err = errors.New(msg)
+						}
+
+						if err != nil {
+							klog.V(2).ErrorS(err, "[wait-control-plane] Failed to startup control plane component", "component", component)
+							ch <- false
+						} else {
+							ch <- true
+						}
+					}
+				}(req, name)
+
+				prober = append(prober, f)
+			}
+		}
+	}
+
+	return prober
+}
+
+// isStartup returns true if all startup probes success
+func (p startupProber) isStartup() bool {
+	ch := make(chan startupResult, len(p))
+
+	for _, r := range p {
+		go r(ch)
+	}
+
+	for range p {
+		if result := <-ch; !result {
+			return false
+		}
+	}
+
+	return true
 }
