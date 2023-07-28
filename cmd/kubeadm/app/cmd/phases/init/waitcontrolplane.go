@@ -17,9 +17,12 @@ limitations under the License.
 package phases
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"text/template"
 	"time"
 
@@ -36,8 +39,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
-	"k8s.io/kubernetes/pkg/probe"
-	httpprobe "k8s.io/kubernetes/pkg/probe/http"
 )
 
 var (
@@ -103,9 +104,9 @@ func runWaitControlPlanePhase(c workflow.RunData) error {
 	fmt.Printf("[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory %q. This can take up to %v\n", data.ManifestDir(), timeout)
 
 	prober := getControlPlaneComponentStartupProber(data.Cfg())
+	start := time.Now()
 	if err := waiter.WaitForKubeletAndFunc(func() error {
-		start := time.Now()
-		return wait.PollImmediate(10*time.Second, timeout, func() (bool, error) {
+		return wait.Poll(10*time.Second, timeout, func() (bool, error) {
 			if started := prober.isStartup(); !started {
 				return false, nil
 			} else {
@@ -140,7 +141,9 @@ func newControlPlaneWaiter(dryRun bool, timeout time.Duration, client clientset.
 
 type startupResult bool
 
-type startupProber []func(ch chan<- startupResult)
+type startupProber struct {
+	runners []func(ch chan<- startupResult)
+}
 
 // getControlPlaneComponentStartupProber get all control plane component startup probes
 func getControlPlaneComponentStartupProber(cfg *kubeadm.InitConfiguration) startupProber {
@@ -151,31 +154,47 @@ func getControlPlaneComponentStartupProber(cfg *kubeadm.InitConfiguration) start
 			p := container.StartupProbe
 			// Currently control plane component only use http probe
 			if p.HTTPGet != nil {
-				req, err := httpprobe.NewRequestForHTTPGetAction(p.HTTPGet, &container, "", "kubeadm")
+				url := &url.URL{
+					Host:   net.JoinHostPort(p.HTTPGet.Host, p.HTTPGet.Port.String()),
+					Scheme: string(p.HTTPGet.Scheme),
+					Path:   p.HTTPGet.Path,
+				}
+				req, err := http.NewRequest("GET", url.String(), nil)
 				if err != nil {
-					klog.V(2).ErrorS(err, "[wait-control-plane] Failed to create control plane component startup probe request", "component", name)
+					klog.V(1).ErrorS(err, "[wait-control-plane] Failed to create control plane component startup probe request", "component", name)
 					continue
 				}
 
 				timeout := time.Duration(p.TimeoutSeconds) * time.Second
-				f := func(req *http.Request, component string) func(chan<- startupResult) {
-					return func(ch chan<- startupResult) {
-						prober := httpprobe.New(false)
-						result, msg, err := prober.Probe(req, timeout)
-						if result != probe.Success {
-							err = errors.New(msg)
-						}
+				client := &http.Client{
+					Timeout: timeout,
+					Transport: &http.Transport{
+						TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+						DisableKeepAlives: true,
+					},
+				}
 
+				runner := func(client *http.Client, req *http.Request, component string) func(chan<- startupResult) {
+					return func(ch chan<- startupResult) {
+						errMsg := "[wait-control-plane] Failed to startup control plane component"
+						res, err := client.Do(req)
 						if err != nil {
-							klog.V(2).ErrorS(err, "[wait-control-plane] Failed to startup control plane component", "component", component)
+							klog.V(1).ErrorS(err, errMsg, "component", component, "probe", req.URL)
 							ch <- false
-						} else {
+							return
+						}
+						defer res.Body.Close()
+
+						if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
 							ch <- true
+						} else {
+							klog.V(1).ErrorS(nil, errMsg, "component", component, "probe", req.URL, "statuscode", res.StatusCode)
+							ch <- false
 						}
 					}
-				}(req, name)
+				}(client, req, name)
 
-				prober = append(prober, f)
+				prober.runners = append(prober.runners, runner)
 			}
 		}
 	}
@@ -184,14 +203,14 @@ func getControlPlaneComponentStartupProber(cfg *kubeadm.InitConfiguration) start
 }
 
 // isStartup returns true if all startup probes success
-func (p startupProber) isStartup() bool {
-	ch := make(chan startupResult, len(p))
+func (p *startupProber) isStartup() bool {
+	ch := make(chan startupResult, len(p.runners))
 
-	for _, r := range p {
+	for _, r := range p.runners {
 		go r(ch)
 	}
 
-	for range p {
+	for range p.runners {
 		if result := <-ch; !result {
 			return false
 		}
