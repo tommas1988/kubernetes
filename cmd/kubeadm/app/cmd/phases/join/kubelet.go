@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/lithammer/dedent"
 	"github.com/pkg/errors"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
 	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
 	patchnodephase "k8s.io/kubernetes/cmd/kubeadm/app/phases/patchnode"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
@@ -78,6 +80,11 @@ func NewKubeletStartPhase() workflow.Phase {
 			options.TokenStr,
 			options.Patches,
 			options.DryRun,
+		},
+		Phases: []workflow.Phase{
+			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeAPIServer, true),
+			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeControllerManager, true),
+			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeScheduler, false),
 		},
 	}
 }
@@ -237,4 +244,43 @@ func waitForTLSBootstrappedClient() error {
 		_, err := kubeconfigutil.ClientSetFromFile(kubeadmconstants.GetKubeletKubeConfigPath())
 		return (err == nil), nil
 	})
+}
+
+func newWaitControlPlaneComponentSubphase(component string, hidden bool) workflow.Phase {
+	phase := workflow.Phase{
+		Name:   controlplane.WaitControlPlaneComponentPhaseProperties[component].Name,
+		Short:  controlplane.WaitControlPlaneComponentPhaseProperties[component].Short,
+		Run:    runWaitControlPlaneComponentSubphase(component),
+		Hidden: hidden,
+	}
+	return phase
+}
+
+func runWaitControlPlaneComponentSubphase(component string) func(c workflow.RunData) error {
+	return func(c workflow.RunData) error {
+		_, initCfg, _, err := getKubeletStartJoinData(c)
+		if err != nil {
+			return err
+		}
+
+		data, ok := c.(JoinData)
+		if !ok {
+			return errors.New("kubelet-start phase invoked with an invalid data struct")
+		}
+
+		timeout := 40 * time.Second
+		fmt.Printf("[kubelet-start] Waiting for %s to be ready. This can take up to %v\n", component, timeout)
+
+		if data.DryRun() {
+			return nil
+		}
+
+		err = controlplane.WaitForControlPlaneComponentReady(
+			component, timeout, data.ManifestDir(), data.KubeletDir(), initCfg.CertificatesDir)
+		if err != nil {
+			return errors.Wrapf(err, "couldn't start control plane component: %s", component)
+		}
+
+		return nil
+	}
 }
