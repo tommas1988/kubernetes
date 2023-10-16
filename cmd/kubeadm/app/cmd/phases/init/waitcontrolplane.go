@@ -26,9 +26,10 @@ import (
 	"github.com/pkg/errors"
 
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	dryrunutil "k8s.io/kubernetes/cmd/kubeadm/app/util/dryrun"
@@ -59,25 +60,17 @@ var (
 // NewWaitControlPlanePhase is a hidden phase that runs after the control-plane and etcd phases
 func NewWaitControlPlanePhase() workflow.Phase {
 	phase := workflow.Phase{
-		Name: "wait-control-plane",
-		Phases: []workflow.Phase{
-			{
-				Name:   "wait-kubelet",
-				Run:    runWaitKubeletPhase,
-				Hidden: true,
-			},
-			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeAPIServer, true),
-			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeControllerManager, true),
-			newWaitControlPlaneComponentSubphase(kubeadmconstants.KubeScheduler, false),
-		},
+		Name:   "wait-control-plane",
+		Run:    runWaitControlPlanePhase,
+		Hidden: true,
 	}
 	return phase
 }
 
-func runWaitKubeletPhase(c workflow.RunData) error {
+func runWaitControlPlanePhase(c workflow.RunData) error {
 	data, ok := c.(InitData)
 	if !ok {
-		return errors.New("wait-kubelet phase invoked with an invalid data struct")
+		return errors.New("wait-control-plane phase invoked with an invalid data struct")
 	}
 
 	// If we're dry-running, print the generated manifests.
@@ -88,16 +81,37 @@ func runWaitKubeletPhase(c workflow.RunData) error {
 		}
 	}
 
-	timeout := 40 * time.Second
-	waiter, err := newControlPlaneWaiter(data.DryRun(), timeout, nil, data.OutputWriter())
+	// waiter holds the apiclient.Waiter implementation of choice, responsible for querying the API server in various ways and waiting for conditions to be fulfilled
+	klog.V(1).Infoln("[wait-control-plane] Waiting for the API server to be healthy")
+
+	client, err := data.Client()
+	if err != nil {
+		return errors.Wrap(err, "cannot obtain client")
+	}
+
+	timeout := data.Cfg().ClusterConfiguration.APIServer.TimeoutForControlPlane.Duration
+	waiter, err := newControlPlaneWaiter(data.DryRun(), timeout, client, data.OutputWriter())
 	if err != nil {
 		return errors.Wrap(err, "error creating waiter")
 	}
 
-	fmt.Printf("[wait-kubelet] Waiting for the kubelet to to be healthy. This can take up to %v\n", timeout)
+	fmt.Printf("[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory %q. This can take up to %v\n", data.ManifestDir(), timeout)
 
-	endpoint := fmt.Sprintf("http://localhost:%d/healthz", kubeadmconstants.KubeletHealthzPort)
-	if err := waiter.WaitForHealthyKubelet(timeout, endpoint); err != nil {
+	waitForControlPlaneComponentsFunc := waiter.WaitForAPI
+
+	clusterConfig := data.Cfg().ClusterConfiguration
+	if features.Enabled(clusterConfig.FeatureGates, features.WaitForAllControlPlaneComponents) {
+		waitForControlPlaneComponentsFunc = func() error {
+			return controlplane.WaitForControlPlaneComponents(
+				controlplane.ControlPlaneComponents,
+				clusterConfig.APIServer.TimeoutForControlPlane.Duration,
+				data.ManifestDir(),
+				data.KubeletDir(),
+				clusterConfig.CertificatesDir)
+		}
+	}
+
+	if err := waiter.WaitForKubeletAndFunc(waitForControlPlaneComponentsFunc); err != nil {
 		context := struct {
 			Error  string
 			Socket string
@@ -107,7 +121,7 @@ func runWaitKubeletPhase(c workflow.RunData) error {
 		}
 
 		kubeletFailTempl.Execute(data.OutputWriter(), context)
-		return errors.New("couldn't start kubelet service")
+		return errors.New("couldn't initialize a Kubernetes cluster")
 	}
 
 	return nil
@@ -120,42 +134,4 @@ func newControlPlaneWaiter(dryRun bool, timeout time.Duration, client clientset.
 	}
 
 	return apiclient.NewKubeWaiter(client, timeout, out), nil
-}
-
-func newWaitControlPlaneComponentSubphase(component string, hidden bool) workflow.Phase {
-	phase := workflow.Phase{
-		Name:   controlplane.WaitControlPlaneComponentPhaseProperties[component].Name,
-		Short:  controlplane.WaitControlPlaneComponentPhaseProperties[component].Short,
-		Run:    runWaitControlPlaneComponentSubphase(component),
-		Hidden: hidden,
-	}
-	return phase
-}
-
-func runWaitControlPlaneComponentSubphase(component string) func(c workflow.RunData) error {
-	return func(c workflow.RunData) error {
-		data, ok := c.(InitData)
-		if !ok {
-			return errors.New("wait-control-plane-components phase invoked with an invalid data struct")
-		}
-
-		timeout := 40 * time.Second
-		if component == kubeadmconstants.KubeAPIServer {
-			timeout = data.Cfg().ClusterConfiguration.APIServer.TimeoutForControlPlane.Duration
-		}
-
-		fmt.Printf("[wait-control-plane] Waiting for %s to be ready. This can take up to %v\n", component, timeout)
-
-		if data.DryRun() {
-			return nil
-		}
-
-		err := controlplane.WaitForControlPlaneComponentReady(
-			component, timeout, data.ManifestDir(), data.KubeletDir(), data.Cfg().ClusterConfiguration.CertificatesDir)
-		if err != nil {
-			return errors.Wrapf(err, "couldn't start control plane component: %s", component)
-		}
-
-		return nil
-	}
 }
